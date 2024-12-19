@@ -1,0 +1,15 @@
+Metadata-Version: 2.3
+Name: cryptography-fernet
+Version: 0.1.0
+Summary: This package is an example of a Dependency Hallucination. There is no code in this package, it is just a placeholder to prevent exploitation.
+Project-URL: Homepage, https://303sec.com
+Author-email: 303sec <rob@303sec.com>
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.0
+Description-Content-Type: text/markdown
+
+This package is an example of a Dependency Hallucination. If you are trying to install it, you have most likely been given this package incorrectly from an AI coding assistant.
+
+There is no code in this package, it is just a placeholder to prevent exploitation.

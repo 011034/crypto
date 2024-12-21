@@ -1,26 +1,32 @@
 import sys
 import os
 import secrets
+import hashlib
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QLineEdit, QMessageBox, QProgressBar, QRadioButton,
-    QButtonGroup, QTabWidget, QGroupBox, QGridLayout, QComboBox
+    QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
+    QLabel, QPushButton, QFileDialog, QLineEdit, QMessageBox,
+    QProgressBar, QRadioButton, QButtonGroup, QComboBox, QInputDialog, QTabWidget
 )
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB
+from argon2 import low_level
+
+CHUNK_SIZE = 1024 * 1024  # 1 MB chunk for GCM mode
 
 def pkcs7_pad(data: bytes, block_size=16) -> bytes:
+    """Apply PKCS#7 padding for CBC mode."""
     pad_len = block_size - (len(data) % block_size)
     return data + bytes([pad_len] * pad_len)
 
 def pkcs7_unpad(data: bytes, block_size=16) -> bytes:
+    """Remove PKCS#7 padding."""
     if len(data) == 0 or len(data) % block_size != 0:
         raise ValueError("Invalid PKCS#7 padded data.")
     pad_len = data[-1]
@@ -31,28 +37,34 @@ def pkcs7_unpad(data: bytes, block_size=16) -> bytes:
     return data[:-pad_len]
 
 def check_password_strength(passphrase: str) -> bool:
-    """Simple password strength check (min length 8, must contain letters and digits)."""
-    if len(passphrase) < 8:
+    """Improved password strength check:
+    - At least 12 characters
+    - Contains uppercase, lowercase, digits, and symbols
+    """
+    if len(passphrase) < 12:
         return False
-    has_digit = any(ch.isdigit() for ch in passphrase)
-    has_alpha = any(ch.isalpha() for ch in passphrase)
-    return has_digit and has_alpha
+    has_upper = any(c.isupper() for c in passphrase)
+    has_lower = any(c.islower() for c in passphrase)
+    has_digit = any(c.isdigit() for c in passphrase)
+    has_symbol = any(c in "!@#$%^&*()-_=+[]{}|;:'\",.<>/?`~" for c in passphrase)
+    return has_upper and has_lower and has_digit and has_symbol
 
-def derive_kek(passphrase: str, salt: bytes, iterations: int = 100000) -> bytes:
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
+def derive_kek(passphrase: str, salt: bytes, iterations: int = 2, memory_cost: int = 102400, parallelism: int = 8) -> bytes:
+    """Derive the Key Encryption Key (KEK) from the user's passphrase using Argon2id."""
+    return low_level.hash_secret_raw(
+        secret=passphrase.encode('utf-8'),
         salt=salt,
-        iterations=iterations,
+        time_cost=iterations,
+        memory_cost=memory_cost,
+        parallelism=parallelism,
+        hash_len=32,
+        type=low_level.Type.ID
     )
-    return kdf.derive(passphrase.encode("utf-8"))
 
 class PassphraseDialog:
     """Static method for prompting user passphrase via QInputDialog."""
     @staticmethod
     def get_passphrase(title: str, prompt: str):
-        from PyQt5.QtWidgets import QInputDialog, QLineEdit
         passphrase, ok = QInputDialog.getText(None, title, prompt, echo=QLineEdit.Password)
         return passphrase, ok
 
@@ -60,7 +72,7 @@ class KeyManager:
     """
     Manages AES key generation, saving, and loading in two modes:
       1) standard: raw 32-byte key
-      2) passphrase: AES-GCM-encrypted key [nonce(12)+tag(16)+enc(32)+salt(16)]
+      2) passphrase: AES-GCM-encrypted key [nonce(12)+tag(16)+enc(32)+salt(32)]
     """
     @staticmethod
     def generate_key() -> bytes:
@@ -74,14 +86,14 @@ class KeyManager:
         else:
             passphrase, ok = PassphraseDialog.get_passphrase(
                 "Save Key (Passphrase)",
-                "Enter passphrase (>=8 chars, must have letters & digits):"
+                "Enter passphrase (>=12 chars, must include uppercase, lowercase, digits & symbols):"
             )
             if not ok or not passphrase:
                 raise ValueError("No passphrase provided; cannot save key.")
             if not check_password_strength(passphrase):
                 raise ValueError("Passphrase is too weak.")
 
-            salt = secrets.token_bytes(16)
+            salt = secrets.token_bytes(32)  # Increased salt size to 32 bytes
             kek = derive_kek(passphrase, salt)
             nonce = secrets.token_bytes(12)
             cipher = Cipher(algorithms.AES(kek), modes.GCM(nonce))
@@ -106,13 +118,13 @@ class KeyManager:
         else:
             with open(file_path, "rb") as f:
                 data = f.read()
-            if len(data) < 60:
+            if len(data) < (12 + 16 + 32 + 32):
                 raise ValueError("Invalid passphrase-encrypted .key file (too small).")
 
             nonce = data[:12]
             tag = data[12:28]
-            enc_key = data[28:-16]
-            salt = data[-16:]
+            enc_key = data[28:-32]
+            salt = data[-32:]
 
             passphrase, ok = PassphraseDialog.get_passphrase(
                 "Load Key (Passphrase)",
@@ -129,6 +141,10 @@ class KeyManager:
                 raise ValueError("Decrypted key is not 32 bytes. Possibly wrong passphrase.")
             return raw_key
 
+# ------------------------------------------------------------------------
+# Encryption / Decryption Thread Classes
+# Each handles different AES modes in one run() method, chosen by algorithm.
+# ------------------------------------------------------------------------
 
 class EncryptThread(QThread):
     progress_signal = pyqtSignal(int)
@@ -137,11 +153,6 @@ class EncryptThread(QThread):
     def __init__(self, input_file: str, output_file: str, key: bytes, algorithm: str, parent=None):
         """
         algorithm: "AES-256-GCM", "AES-256-CBC", or "AES-256-CTR"
-        For brevity, we do a minimal approach:
-         - GCM: chunk-based encryption with [nonce+tag+ciphertext].
-         - CBC: read all data, PKCS#7 pad, then write [iv + ciphertext].
-         - CTR: read all data, write [iv + ciphertext].
-        (No HMAC in this minimal example for CBC/CTR.)
         """
         super().__init__(parent)
         self.input_file = input_file
@@ -163,6 +174,9 @@ class EncryptThread(QThread):
         except Exception as e:
             self.done_signal.emit(False, f"Encryption failed ({self.algorithm}): {e}")
 
+    # ---------------------------
+    # AES-GCM chunk-based
+    # ---------------------------
     def encrypt_gcm(self):
         file_size = os.path.getsize(self.input_file)
         nonce = secrets.token_bytes(12)
@@ -173,7 +187,7 @@ class EncryptThread(QThread):
         with open(self.input_file, "rb") as fin, open(self.output_file, "wb") as fout:
             # Write nonce, reserve space for tag
             fout.write(nonce)
-            fout.seek(12 + 16)
+            fout.seek(12 + 16)  # skip 12 bytes for nonce + 16 for tag
 
             while True:
                 chunk = fin.read(CHUNK_SIZE)
@@ -192,12 +206,11 @@ class EncryptThread(QThread):
             fout.seek(12)
             fout.write(tag)
 
+    # ---------------------------
+    # AES-CBC with HMAC
+    # ---------------------------
     def encrypt_cbc(self):
-        """
-        Minimal example: read entire file into memory, PKCS#7 pad, then encrypt,
-        write [iv + ciphertext]. For extremely large files, you'd want a streaming approach.
-        """
-        data = self.read_entire_file()
+        data = self.read_entire_file()  # read entire file into memory
         iv = secrets.token_bytes(16)
         cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv))
         encryptor = cipher.encryptor()
@@ -205,30 +218,42 @@ class EncryptThread(QThread):
         padded_data = pkcs7_pad(data, 16)
         ciphertext = encryptor.update(padded_data) + encryptor.finalize()
 
-        # Just do a single "progress=100%" update here
+        # HMAC(iv + ciphertext)
+        h = hmac.HMAC(self.key, hashes.SHA256())
+        h.update(iv + ciphertext)
+        mac = h.finalize()
+
         self.progress_signal.emit(100)
 
         with open(self.output_file, "wb") as fout:
+            # [iv(16) + ciphertext(...) + mac(32)]
             fout.write(iv)
             fout.write(ciphertext)
+            fout.write(mac)
 
+    # ---------------------------
+    # AES-CTR with HMAC
+    # ---------------------------
     def encrypt_ctr(self):
-        """
-        Minimal example: read entire file into memory, then encrypt with AES-CTR,
-        write [iv + ciphertext].
-        """
         data = self.read_entire_file()
-        iv = secrets.token_bytes(16)  # Used as CTR initial value
+        iv = secrets.token_bytes(16)
         cipher = Cipher(algorithms.AES(self.key), modes.CTR(iv))
         encryptor = cipher.encryptor()
 
         ciphertext = encryptor.update(data) + encryptor.finalize()
 
+        # HMAC(iv + ciphertext)
+        h = hmac.HMAC(self.key, hashes.SHA256())
+        h.update(iv + ciphertext)
+        mac = h.finalize()
+
         self.progress_signal.emit(100)
 
         with open(self.output_file, "wb") as fout:
+            # [iv(16) + ciphertext(...) + mac(32)]
             fout.write(iv)
             fout.write(ciphertext)
+            fout.write(mac)
 
     def read_entire_file(self) -> bytes:
         """Convenience method to read entire input file and update progress after reading."""
@@ -271,6 +296,9 @@ class DecryptThread(QThread):
         except Exception as e:
             self.done_signal.emit(False, f"Decryption failed ({self.algorithm}): {e}")
 
+    # ---------------------------
+    # AES-GCM chunk-based
+    # ---------------------------
     def decrypt_gcm(self):
         file_size = os.path.getsize(self.input_file)
         with open(self.input_file, "rb") as fin:
@@ -298,13 +326,22 @@ class DecryptThread(QThread):
                 final_chunk = decryptor.finalize()
                 fout.write(final_chunk)
 
+    # ---------------------------
+    # AES-CBC with HMAC
+    # ---------------------------
     def decrypt_cbc(self):
         data = self.read_entire_file()
-        if len(data) < 16:
-            raise ValueError("Invalid CBC file (missing IV).")
+        if len(data) < 16 + 32:
+            raise ValueError("Invalid CBC file (missing IV or HMAC).")
 
         iv = data[:16]
-        ciphertext = data[16:]
+        mac = data[-32:]
+        ciphertext = data[16:-32]
+
+        # Verify HMAC
+        h = hmac.HMAC(self.key, hashes.SHA256())
+        h.update(iv + ciphertext)
+        h.verify(mac)
 
         cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv))
         decryptor = cipher.decryptor()
@@ -312,28 +349,36 @@ class DecryptThread(QThread):
         plaintext = pkcs7_unpad(padded_plain, 16)
 
         self.progress_signal.emit(100)
-
         with open(self.output_file, "wb") as fout:
             fout.write(plaintext)
 
+    # ---------------------------
+    # AES-CTR with HMAC
+    # ---------------------------
     def decrypt_ctr(self):
         data = self.read_entire_file()
-        if len(data) < 16:
-            raise ValueError("Invalid CTR file (missing IV).")
+        if len(data) < 16 + 32:
+            raise ValueError("Invalid CTR file (missing IV or HMAC).")
 
         iv = data[:16]
-        ciphertext = data[16:]
+        mac = data[-32:]
+        ciphertext = data[16:-32]
+
+        # Verify HMAC
+        h = hmac.HMAC(self.key, hashes.SHA256())
+        h.update(iv + ciphertext)
+        h.verify(mac)
 
         cipher = Cipher(algorithms.AES(self.key), modes.CTR(iv))
         decryptor = cipher.decryptor()
         plaintext = decryptor.update(ciphertext) + decryptor.finalize()
 
         self.progress_signal.emit(100)
-
         with open(self.output_file, "wb") as fout:
             fout.write(plaintext)
 
     def read_entire_file(self) -> bytes:
+        """Convenience method to read entire input file and update progress after reading."""
         file_size = os.path.getsize(self.input_file)
         processed = 0
         data = b''
@@ -358,7 +403,7 @@ class DecryptThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AES-256 Multi-Mode Encrypt/Decrypt (Improved GUI)")
+        self.setWindowTitle("AES-256 Multi-Mode Encrypt/Decrypt with HMAC and Argon2")
         self.resize(900, 600)
 
         self.apply_custom_palette()
@@ -536,6 +581,15 @@ class MainWindow(QMainWindow):
         if not output_file:
             return
 
+        # Compute SHA-256 of the original file, store .hash
+        original_hash = compute_sha256(input_file)
+        hash_path = output_file + ".hash"
+        try:
+            with open(hash_path, 'w') as hf:
+                hf.write(original_hash)
+        except Exception as e:
+            QMessageBox.warning(self, "Warning", f"Failed to save hash file: {e}")
+
         algorithm = self.combo_alg_enc.currentText()
 
         self.encrypt_thread = EncryptThread(input_file, output_file, self.key_data, algorithm)
@@ -626,6 +680,20 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Error", msg)
 
+def compute_sha256(file_path):
+    """Compute SHA-256 hash of an entire file."""
+    sha = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(4096)
+            if not chunk:
+                break
+            sha.update(chunk)
+    return sha.hexdigest()
+
+# ------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------
 
 def main():
     app = QApplication(sys.argv)

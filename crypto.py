@@ -129,10 +129,6 @@ class KeyManager:
                 raise ValueError("Decrypted key is not 32 bytes. Possibly wrong passphrase.")
             return raw_key
 
-# ------------------------------------------------------------------------
-# Encryption / Decryption Thread Classes
-# Each handles different AES modes in one run() method, chosen by algorithm.
-# ------------------------------------------------------------------------
 
 class EncryptThread(QThread):
     progress_signal = pyqtSignal(int)
